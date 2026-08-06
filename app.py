@@ -124,12 +124,52 @@ def status(m,d,g):
     if d<e:return "Approaching grade-level mastery"
     if m>=90 and d>e:return "Exceeding grade-level expectations"
     return "Meeting grade-level expectations" if m>=75 else "Developing grade-level mastery"
-def make_question(grade,topic,difficulty):
-    if topic=="mixed_review": topic=random.choice(["geography","history","civics","economics","culture"])
-    items=BANK[grade].get(topic) or BANK[grade]["history"]
-    prompt,choices,answer,standard=random.choice(items)
-    ch=choices[:]; random.shuffle(ch)
-    return {"topic":topic,"prompt":prompt,"choices":ch,"answer":answer,"standard":standard}
+def make_question(grade, topic, difficulty, used_prompts=None):
+    used_prompts = set(used_prompts or [])
+
+    if topic == "mixed_review":
+        items = []
+
+        for review_topic in (
+            "geography",
+            "history",
+            "civics",
+            "economics",
+            "culture",
+        ):
+            for item in BANK[grade].get(review_topic, []):
+                items.append((review_topic, item))
+    else:
+        items = [
+            (topic, item)
+            for item in (
+                BANK[grade].get(topic)
+                or BANK[grade]["history"]
+            )
+        ]
+
+    unused_items = [
+        item
+        for item in items
+        if item[1][0] not in used_prompts
+    ]
+
+    # Only repeat after every available question has been used.
+    selection_pool = unused_items or items
+
+    selected_topic, selected = random.choice(selection_pool)
+    prompt, choices, answer, standard = selected
+
+    shuffled_choices = choices[:]
+    random.shuffle(shuffled_choices)
+
+    return {
+        "topic": selected_topic,
+        "prompt": prompt,
+        "choices": shuffled_choices,
+        "answer": answer,
+        "standard": standard,
+    }
 def parent_required(fn):
     @wraps(fn)
     def wrap(*a,**k):
@@ -166,7 +206,7 @@ def start(key):
     sid=session.get("student_id")
     with db() as c:s=c.execute("SELECT * FROM students WHERE id=?",(sid,)).fetchone()
     mode="diagnostic" if not s["diagnostic_complete"] else "test"
-    session["test"]={"key":key,"topic":THEMES[key]["topic"],"mode":mode,"grade":s["grade_level"],"start_diff":s["current_difficulty"],"diff":s["current_difficulty"],"total":12 if mode=="diagnostic" else 10,"current":0,"correct":0,"answers":[],"started":time.time(),"qstarted":time.time()}
+    session["test"]={"key":key,"topic":THEMES[key]["topic"],"mode":mode,"grade":s["grade_level"],"start_diff":s["current_difficulty"],"diff":s["current_difficulty"],"total":12 if mode=="diagnostic" else 10,"current":0,"correct":0,"answers":[],"used_prompts":[],"started":time.time(),"qstarted":time.time()}
     return redirect(url_for("question"))
 @app.route("/question",methods=["GET","POST"])
 def question():
@@ -176,14 +216,50 @@ def question():
     if request.method=="POST":
         sub=request.form.get("answer",""); elapsed=max(.1,time.time()-t["qstarted"]); q=t["question"]; ok=sub==q["answer"]
         if ok:t["correct"]+=1
-        t["answers"].append({"n":t["current"]+1,"topic":q["topic"],"diff":t["diff"],"prompt":q["prompt"],"expected":q["answer"],"submitted":sub,"ok":ok,"seconds":round(elapsed,2),"standard":q["standard"]})
-        t["current"]+=1; recent=t["answers"][-3:]
+        t["answers"].append({
+            "n": t["current"] + 1,
+            "topic": q["topic"],
+            "diff": t["diff"],
+            "prompt": q["prompt"],
+            "expected": q["answer"],
+            "submitted": sub,
+            "ok": ok,
+            "seconds": round(elapsed, 2),
+            "standard": q["standard"],
+        })
+
+        # Remove the answered question so the next one can be generated.
+        t.pop("question", None)
+
+        t["current"] += 1
+        recent = t["answers"][-3:]
         if len(recent)==3 and all(x["ok"] for x in recent):t["diff"]=min(5,t["diff"]+1)
         elif len(recent)==3 and sum(x["ok"] for x in recent)<=1:t["diff"]=max(1,t["diff"]-1)
         if t["current"]>=t["total"]:session["test"]=t;return redirect(url_for("finish"))
         feedback="Correct!" if ok else f"Correct answer: {q['answer']}"
-    t["question"]=make_question(t["grade"],t["topic"],t["diff"]);t["qstarted"]=time.time();session["test"]=t
-    return render_template("question.html",test=t,theme=THEMES[t["key"]],feedback=feedback)
+    # Keep the same question if the browser page is refreshed.
+    if "question" not in t:
+        t["question"] = make_question(
+            t["grade"],
+            t["topic"],
+            t["diff"],
+            t.get("used_prompts", []),
+        )
+
+        t.setdefault("used_prompts", []).append(
+            t["question"]["prompt"]
+        )
+
+        t["qstarted"] = time.time()
+
+    session["test"] = t
+
+    return render_template(
+        "question.html",
+        test=t,
+        theme=THEMES[t["key"]],
+        feedback=feedback,
+    )
 @app.route("/finish")
 def finish():
     t=session.get("test");sid=session.get("student_id")
